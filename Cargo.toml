@@ -1,0 +1,12 @@
+[package]
+name = "nalimov"
+version = "0.1.0"
+edition = "2024"
+description = "Zero-dependency Nalimov endgame tablebase prober — pure Rust, 3–6 pieces, thread-safe"
+license = "MIT"
+repository = "https://github.com/jromang/nalimov-rs"
+keywords = ["chess", "endgame", "tablebase", "nalimov"]
+categories = ["game-engines", "algorithms"]
+
+[lib]
+crate-type = ["lib", "staticlib"]
