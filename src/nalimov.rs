@@ -4523,25 +4523,26 @@ fn read_score_from_block(block: &[u8], offset: usize, is_16bit: bool) -> Option<
 }
 
 /// Convert a DTM score to NalimovResult.
+///
+/// Nalimov L-score encoding:
+///   Win:  L_score = L_BEV_BROKEN (32767) - DTM_moves  →  DTM_moves = 32767 - L_score
+///   Loss: L_score = -(L_BEV_BROKEN - DTM_moves)       →  DTM_moves = 32767 + L_score
+///
+/// Conversion to plies (half-moves):
+///   Win:  plies = 2 * DTM_moves - 1  (winning side delivers the last move)
+///   Loss: plies = 2 * DTM_moves      (opponent delivers the mating move)
 fn score_to_result(score: i32) -> NalimovResult {
     if score == 0 {
         NalimovResult::Draw
     } else if score > 0 {
-        // Side to move wins
-        let plies = if score > 32640 {
-            (score - 32640) as u16
-        } else {
-            score as u16
-        };
-        NalimovResult::Win { plies }
+        // Side to move wins in DTM_moves full moves
+        let moves = (L_BEV_BROKEN - score) as u16;
+        NalimovResult::Win { plies: 2 * moves - 1 }
     } else {
-        // Side to move loses
-        let plies = if score < -32640 {
-            (-score - 32640) as u16
-        } else {
-            (-score) as u16
-        };
-        NalimovResult::Loss { plies }
+        // Side to move loses in DTM_moves full moves
+        // plies = 2 * moves - 2 (opponent delivers the mating move)
+        let moves = (L_BEV_BROKEN + score) as u16;
+        NalimovResult::Loss { plies: 2 * moves - 2 }
     }
 }
 
