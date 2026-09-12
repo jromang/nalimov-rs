@@ -7,7 +7,7 @@ Zero-dependency, pure Rust implementation of [Nalimov endgame tablebase](https:/
 Reads `.nbw.emd` / `.nbb.emd` compressed files and returns exact distance-to-mate (DTM) values.
 
 - **3–6 piece** endgames with en passant support
-- **Thread-safe** — `Mutex` + O(1) LRU block cache (256 MB)
+- **Thread-safe** — `Mutex` + configurable O(1) LRU block cache
 - **Faster** than the original C++ implementation on cache-hot probes
 - **Zero external crate dependencies** — pure `std` only
 - **C API** — build as a static library, link from C/C++
@@ -90,7 +90,7 @@ nalimov = { git = "https://github.com/jromang/nalimov-rs" }
 ```rust
 use nalimov::{NalimovProber, NalimovResult};
 
-let prober = NalimovProber::new(&["/path/to/nalimov/3-4-5"]).unwrap();
+let prober = NalimovProber::new(&["/path/to/nalimov/3-4-5"], 256).unwrap();
 
 // KQvK: White Ke1(4) Qd1(3), Black Kh8(63) — White to move
 // Square mapping: a1=0, b1=1, …, h1=7, a2=8, …, h8=63 (LERF)
@@ -296,7 +296,8 @@ fn search(&self, pos: &Position, alpha: i32, beta: i32, depth: i32) -> i32 {
 
 - The first probe for a given material will read the file header from disk.
   Subsequent probes for the same material hit the in-memory block cache.
-- The LRU cache holds **256 MB** of decompressed blocks (32 768 × 8 KB).
+- The LRU cache size is selected at construction in MiB. A 256 MiB cache holds
+  32 768 decompressed blocks of 8 KiB each.
   Cache-hot probes are fast — no I/O or decompression.
 - For best results, place tablebase files on an SSD and probe only when
   `piece_count` is within the range of your installed tables.

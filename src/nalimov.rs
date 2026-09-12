@@ -5,7 +5,7 @@
 //! and returns exact distance-to-mate (DTM) values.
 //!
 //! - **3–6 piece** endgames, with en passant support
-//! - **Thread-safe** (`Mutex` + O(1) LRU block cache)
+//! - **Thread-safe** (`Mutex` + configurable O(1) LRU block cache)
 //! - **Faster** than the original C++ on cache-hot probes
 //! - **No external crates** — just drop `nalimov.rs` into your project
 //!
@@ -45,7 +45,7 @@
 //! ```no_run
 //! use nalimov::{NalimovProber, NalimovResult};
 //!
-//! let prober = NalimovProber::new(&["/path/to/nalimov/3-4-5"]).unwrap();
+//! let prober = NalimovProber::new(&["/path/to/nalimov/3-4-5"], 256).unwrap();
 //!
 //! // KQvK: White Ke1(4) Qd1(3), Black Kh8(63) — White to move
 //! // Square mapping: a1=0, b1=1, …, h1=7, a2=8, …, h8=63 (LERF)
@@ -186,6 +186,15 @@ use std::ptr::{self, NonNull};
 use std::sync::{Arc, Mutex, OnceLock};
 
 // ── O(1) LRU cache (intrusive doubly-linked list + HashMap) ──────────────
+
+const CACHE_BLOCKS_PER_MB: usize = 128; // 1 MiB / 8 KiB
+
+fn cache_blocks_for_size_mb(cache_size_mb: usize) -> Result<usize, NalimovError> {
+    cache_size_mb
+        .checked_mul(CACHE_BLOCKS_PER_MB)
+        .filter(|&blocks| blocks > 0)
+        .ok_or(NalimovError::InvalidCacheSize)
+}
 
 struct LruEntry<K, V> {
     key: std::mem::MaybeUninit<K>,
@@ -336,6 +345,7 @@ pub enum NalimovResult {
 #[derive(Debug)]
 pub enum NalimovError {
     Io(std::io::Error),
+    InvalidCacheSize,
     NoTablebases,
     PositionNotFound,
     DecompressError(String),
@@ -4033,18 +4043,20 @@ impl NalimovProber {
     ///
     /// ```no_run
     /// use nalimov::NalimovProber;
-    /// let prober = NalimovProber::new(&[
-    ///     "/path/to/3-4-5",
-    ///     "/path/to/6-piece",
-    /// ]).unwrap();
+    /// let prober = NalimovProber::new(
+    ///     &["/path/to/3-4-5", "/path/to/6-piece"],
+    ///     256,
+    /// ).unwrap();
     /// ```
-    pub fn new(paths: &[&str]) -> Result<Self, NalimovError> {
+    pub fn new(paths: &[&str], cache_size_mb: usize) -> Result<Self, NalimovError> {
+        let cache_blocks = cache_blocks_for_size_mb(cache_size_mb)?;
+
         // Force initialization of enumerations
         let _ = get_enumerations();
 
         let mut state = NalimovState {
             tables: HashMap::new(),
-            cache: LruCache::new(32768), // 32768 × 8KB = 256MB
+            cache: LruCache::new(cache_blocks),
         };
 
         let mut found_any = false;
@@ -4566,7 +4578,7 @@ pub extern "C" fn rs_nalimov_init(path: *const c_char) -> c_int {
         Ok(s) => s,
         Err(_) => return 0,
     };
-    match GLOBAL_PROBER.set(match NalimovProber::new(&[path_str]) {
+    match GLOBAL_PROBER.set(match NalimovProber::new(&[path_str], 256) {
         Ok(p) => p,
         Err(_) => return 0,
     }) {
@@ -4629,6 +4641,14 @@ pub extern "C" fn rs_nalimov_probe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_configurable_cache_capacity() {
+        assert_eq!(cache_blocks_for_size_mb(1).unwrap(), 128);
+        assert_eq!(cache_blocks_for_size_mb(256).unwrap(), 32768);
+        let err = cache_blocks_for_size_mb(0).unwrap_err();
+        assert!(matches!(err, NalimovError::InvalidCacheSize));
+    }
 
     #[test]
     fn test_s_to_l() {
