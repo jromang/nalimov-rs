@@ -3709,7 +3709,7 @@ fn comp_open(data: &[u8], check_crc: bool) -> Result<DecodeInfo, String> {
 }
 
 /// Parse compression header by reading only the header portion of a file.
-fn comp_open_from_file(path: &str) -> Result<DecodeInfo, String> {
+fn comp_open_from_file(path: &str, check_crc: bool) -> Result<DecodeInfo, String> {
     let mut f = File::open(path).map_err(|e| format!("{path}: {e}"))?;
 
     // Read the fixed header (80 bytes) to learn the full header size.
@@ -3737,7 +3737,7 @@ fn comp_open_from_file(path: &str) -> Result<DecodeInfo, String> {
     f.seek(SeekFrom::Start(0)).map_err(|e| format!("{path}: seek start: {e}"))?;
     f.read_exact(&mut buf).map_err(|e| format!("{path}: read meta: {e}"))?;
 
-    comp_open(&buf, false)
+    comp_open(&buf, check_crc)
 }
 
 /// Read and decompress a single block from a file on disk (no full-file loading).
@@ -3765,7 +3765,10 @@ fn decompress_block_from_file(
     let mut comp_data = vec![0u8; comp_size];
     f.read_exact(&mut comp_data).map_err(|e| format!("{path}: read block: {e}"))?;
 
-    // CRC check on compressed data
+    // CRC check on compressed data: it catches any change to the bytes on disk, before
+    // they reach the decoder. The CRC of the decompressed block is left to the tests
+    // (`every_block_of_every_table_passes_its_crc`): it would only guard the decoder,
+    // and costs three to four times as much, being taken over the whole block.
     if info.check_crc && !info.crc.is_empty() {
         let expected = info.crc[block_num * 2 + 1];
         let computed = crc32_compute(&comp_data, 0);
@@ -3779,16 +3782,11 @@ fn decompress_block_from_file(
     }
 
     // Decompress using LZ77+Huffman
-    decompress_raw(info, &comp_data, orig_size, block_num)
+    decompress_raw(info, &comp_data, orig_size)
 }
 
 /// Core LZ77+Huffman decompression from compressed bytes.
-fn decompress_raw(
-    info: &DecodeInfo,
-    comp_data: &[u8],
-    orig_size: usize,
-    block_num: usize,
-) -> Result<Vec<u8>, String> {
+fn decompress_raw(info: &DecodeInfo, comp_data: &[u8], orig_size: usize) -> Result<Vec<u8>, String> {
     let mut output = vec![0u8; orig_size];
     let mut br = BitReader::new(comp_data, 0);
     let mut p = 0usize;
@@ -3803,13 +3801,18 @@ fn decompress_raw(
         }
 
         let dist = info.distance[(ch >> MAX_LENGTH_BITS) as usize];
-        let s = (p as i32 + dist) as usize;
 
         let mut len = ch & ((MAX_LENGTH - 1) as i32);
         if len >= LONG_LENGTH as i32 {
             len -= LONG_LENGTH as i32 - LONG_BITS as i32;
             if len == DELTA as i32 {
                 len = br.read(5) as i32 + DELTA as i32;
+            }
+            // A match spans at least 2^len bytes and never more than a block, which is at
+            // most 2^MAX_BLOCK_BITS: a wider count only comes from a damaged stream, and
+            // would overflow the shifts below.
+            if len > MAX_BLOCK_BITS as i32 {
+                return Err("broken block: match length out of range".into());
             }
             let mut n = 1i32 << len;
             if len > 16 {
@@ -3820,6 +3823,15 @@ fn decompress_raw(
         }
         let len = (len + 1) as usize;
 
+        // A damaged stream can point the copy before the start of the block or run it
+        // past the end. Return an error, as the original decoder does, rather than index
+        // out of bounds: the caller treats a failed probe as a miss.
+        let start = p as i64 + dist as i64;
+        if start < 0 || len > orig_size - p {
+            return Err("broken block: copy outside the block".into());
+        }
+        let s = start as usize;
+
         if s + len <= p {
             output.copy_within(s..s + len, p);
         } else {
@@ -3828,15 +3840,6 @@ fn decompress_raw(
             }
         }
         p += len;
-    }
-
-    // CRC check on decompressed data
-    if info.check_crc && !info.crc.is_empty() {
-        let expected = info.crc[block_num * 2];
-        let computed = crc32_compute(&output, 0);
-        if expected != computed {
-            return Err("decompressed block CRC mismatch".into());
-        }
     }
 
     Ok(output)
@@ -4324,7 +4327,7 @@ impl NalimovProber {
 
         // Lazily load decode_info (file header) on first access
         if tb_file.decode_info.is_none() {
-            let info = comp_open_from_file(&tb_file.path)
+            let info = comp_open_from_file(&tb_file.path, true)
                 .map_err(NalimovError::DecompressError)?;
             tb_file.decode_info = Some(Arc::new(info));
         }
@@ -4721,6 +4724,167 @@ mod tests {
         let (config2, inv2) = build_config(&counters2);
         assert_eq!(config2, "krk");
         assert!(inv2);
+    }
+
+    /// Directory holding the 3-4-5 set (`NALIMOV_PATH`), for the tests that need real
+    /// files. They pass vacuously, with a note, when it is not set.
+    fn table_dir() -> Option<std::path::PathBuf> {
+        let dir = std::path::PathBuf::from(std::env::var("NALIMOV_PATH").ok()?);
+        dir.join("kqkr.nbw.emd").is_file().then_some(dir)
+    }
+
+    /// The compressed bytes of one block, and its decompressed size.
+    fn read_block(info: &DecodeInfo, path: &std::path::Path, n: usize) -> (Vec<u8>, usize) {
+        let start = calculate_offset(info, n as u32) as u64;
+        let end = calculate_offset(info, n as u32 + 1) as u64;
+        let mut f = File::open(path).unwrap();
+        f.seek(SeekFrom::Start(start)).unwrap();
+        let mut comp = vec![0u8; (end - start) as usize];
+        f.read_exact(&mut comp).unwrap();
+        let orig = if n == info.n_blk - 1 { info.last_block_size } else { info.block_size };
+        (comp, orig)
+    }
+
+    struct XorShift(u64);
+
+    impl XorShift {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % n as u64) as usize
+        }
+    }
+
+    #[test]
+    fn every_block_passes_its_crc() {
+        let Some(dir) = table_dir() else {
+            eprintln!("NALIMOV_PATH not set: skipped");
+            return;
+        };
+        for name in ["kqkr.nbw.emd", "kqkr.nbb.emd"] {
+            let path = dir.join(name);
+            let info = comp_open_from_file(path.to_str().unwrap(), true).unwrap();
+            assert!(!info.crc.is_empty());
+            for n in 0..info.n_blk {
+                let block = decompress_block_from_file(&info, path.to_str().unwrap(), n).unwrap();
+                assert_eq!(crc32_compute(&block, 0), info.crc[2 * n], "{name} block {n}");
+            }
+        }
+    }
+
+    /// Every block of every table under `NALIMOV_PATH` against its CRC: an integrity
+    /// check of a whole set (`cargo test --release -- --ignored`).
+    #[test]
+    #[ignore]
+    fn every_block_of_every_table_passes_its_crc() {
+        let Some(dir) = table_dir() else {
+            eprintln!("NALIMOV_PATH not set: skipped");
+            return;
+        };
+        let mut files: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|x| x == "emd"))
+            .collect();
+        files.sort();
+        let mut bad = Vec::new();
+        for path in &files {
+            let path = path.to_str().unwrap();
+            let info = comp_open_from_file(path, true).unwrap();
+            for n in 0..info.n_blk {
+                match decompress_block_from_file(&info, path, n) {
+                    Ok(block) if crc32_compute(&block, 0) == info.crc[2 * n] => {}
+                    Ok(_) => bad.push(format!("{path} block {n}: decompressed CRC mismatch")),
+                    Err(e) => bad.push(format!("{path} block {n}: {e}")),
+                }
+            }
+        }
+        assert!(bad.is_empty(), "{} of {} files: {bad:#?}", bad.len(), files.len());
+    }
+
+    #[test]
+    fn a_damaged_block_is_an_error_not_a_panic() {
+        let Some(dir) = table_dir() else {
+            eprintln!("NALIMOV_PATH not set: skipped");
+            return;
+        };
+        let path = dir.join("kqkr.nbw.emd");
+        let info = comp_open_from_file(path.to_str().unwrap(), false).unwrap();
+        let mut rng = XorShift(0x9E37_79B9_7F4A_7C15);
+        let (mut tried, mut broken) = (0, 0);
+        for n in 0..info.n_blk {
+            let (comp, orig) = read_block(&info, &path, n);
+            if comp.len() == orig {
+                continue; // stored, not compressed
+            }
+            for _ in 0..64 {
+                let mut bad = comp.clone();
+                for _ in 0..1 + rng.below(4) {
+                    let i = rng.below(bad.len());
+                    bad[i] ^= 1 + rng.below(255) as u8;
+                }
+                // Without the CRC, the decoder itself must refuse what it cannot place.
+                if decompress_raw(&info, &bad, orig).is_err() {
+                    broken += 1;
+                }
+                tried += 1;
+            }
+        }
+        assert!(tried > 0);
+        assert!(broken > 0, "{tried} damaged blocks, none refused");
+    }
+
+    #[test]
+    fn a_damaged_file_fails_its_probes_cleanly() {
+        let Some(dir) = table_dir() else {
+            eprintln!("NALIMOV_PATH not set: skipped");
+            return;
+        };
+        // A copy of KQ v KR with one byte changed in every compressed block of the
+        // white-to-move file, at a length the header still accepts.
+        let tmp = std::env::temp_dir().join(format!("nalimov-damaged-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        for name in ["kqkr.nbw.emd", "kqkr.nbb.emd"] {
+            std::fs::copy(dir.join(name), tmp.join(name)).unwrap();
+        }
+        let path = tmp.join("kqkr.nbw.emd");
+        let info = comp_open_from_file(path.to_str().unwrap(), false).unwrap();
+        let mut data = std::fs::read(&path).unwrap();
+        for n in 0..info.n_blk {
+            let start = calculate_offset(&info, n as u32) as usize;
+            let end = calculate_offset(&info, n as u32 + 1) as usize;
+            data[(start + end) / 2] ^= 0x5A;
+        }
+        std::fs::write(&path, &data).unwrap();
+
+        // A large stack: unoptimised, the enumeration tables are built on the stack
+        // before being boxed, and overflow the 2 MB of a test thread.
+        let dir_str = tmp.to_str().unwrap().to_owned();
+        let failed = std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(move || {
+                let prober = NalimovProber::new(&[&dir_str], 1).unwrap();
+                let mut rng = XorShift(0x2545_F491_4F6C_DD1D);
+                let mut failed = 0;
+                for _ in 0..2_000 {
+                    let sq: [u32; 4] = std::array::from_fn(|_| rng.below(64) as u32);
+                    if (1..4).any(|i| sq[..i].contains(&sq[i])) {
+                        continue;
+                    }
+                    let [wk, wq, bk, br] = sq.map(|s| 1u64 << s);
+                    let result = prober.probe(wk | wq, bk | br, wk | bk, wq, br, 0, 0, 0, true, 64);
+                    if matches!(result, Err(NalimovError::DecompressError(_))) {
+                        failed += 1;
+                    }
+                }
+                failed
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        std::fs::remove_dir_all(&tmp).unwrap();
+        assert!(failed > 0, "no probe saw the damage");
     }
 
     #[test]
