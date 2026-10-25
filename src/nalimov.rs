@@ -1017,18 +1017,22 @@ fn f_in_triangle(sqwk: u32, sqbk: u32) -> bool {
 // ============================================================================
 
 /// Lazily initialized enumeration tables for Nalimov index calculation.
+///
+/// Every table above a few kilobytes lives behind its own `Box`, allocated zeroed on the
+/// heap (`zeroed_box`): built in place, the struct would pass ~2.4 MB through the stack
+/// in an unoptimised build, more than the 2 MB of a spawned thread.
 struct Enumerations {
     // sq_piece[piece][king_sq*64 + piece_sq] -> enumerated index (0xFF = illegal)
-    sq_piece: [[u8; 64 * 64]; 6],
+    sq_piece: Box<[[u8; 64 * 64]; 6]>,
     // c_legal[piece][king_sq] -> count of legal squares
     c_legal: [[u8; 64]; 6],
     // Single piece offset tables
     single_pawnless: [[u32; 462]; 6],
-    single_pawn: [[u32; 1806]; 6],
+    single_pawn: Box<[[u32; 1806]; 6]>,
     // Pair piece offset tables
-    pair_pawnless: [[[u32; 462]; 6]; 6],
-    pair_pawn: [[[u32; 1806]; 6]; 6],
-    // Triple piece offset tables (boxed because very large)
+    pair_pawnless: Box<[[[u32; 462]; 6]; 6]>,
+    pair_pawn: Box<[[[u32; 1806]; 6]; 6]>,
+    // Triple piece offset tables
     triple_pawnless: Box<[[[[u32; 462]; 6]; 6]; 6]>,
     triple_pawn: Box<[[[[u32; 1806]; 6]; 6]; 6]>,
     // Total enumeration counts
@@ -1040,18 +1044,30 @@ struct Enumerations {
     count_triple_pawn: [[[u32; 6]; 6]; 6],
 }
 
+/// A zero-filled value allocated directly on the heap. `Box::new([0; N])` builds the
+/// array on the stack and then moves it, unless the optimiser removes the copy.
+///
+/// # Safety
+/// The all-zero bit pattern must be a valid `T`: here, arrays of integers.
+unsafe fn zeroed_box<T>() -> Box<T> {
+    unsafe { Box::<T>::new_zeroed().assume_init() }
+}
+
 fn get_enumerations() -> &'static Enumerations {
     static ENUMS: OnceLock<Box<Enumerations>> = OnceLock::new();
     ENUMS.get_or_init(|| {
+        // SAFETY: integer arrays, for which all-zero is a valid value.
+        let mut sq_piece: Box<[[u8; 64 * 64]; 6]> = unsafe { zeroed_box() };
+        sq_piece.iter_mut().for_each(|t| t.fill(0xFF));
         let mut e = Box::new(Enumerations {
-            sq_piece: [[0xFF; 64 * 64]; 6],
+            sq_piece,
             c_legal: [[0; 64]; 6],
             single_pawnless: [[0; 462]; 6],
-            single_pawn: [[0; 1806]; 6],
-            pair_pawnless: [[[0; 462]; 6]; 6],
-            pair_pawn: [[[0; 1806]; 6]; 6],
-            triple_pawnless: Box::new([[[[0; 462]; 6]; 6]; 6]),
-            triple_pawn: Box::new([[[[0; 1806]; 6]; 6]; 6]),
+            single_pawn: unsafe { zeroed_box() },
+            pair_pawnless: unsafe { zeroed_box() },
+            pair_pawn: unsafe { zeroed_box() },
+            triple_pawnless: unsafe { zeroed_box() },
+            triple_pawn: unsafe { zeroed_box() },
             count_single_pawnless: [0; 6],
             count_single_pawn: [0; 6],
             count_pair_pawnless: [[0; 6]; 6],
@@ -4858,33 +4874,36 @@ mod tests {
         }
         std::fs::write(&path, &data).unwrap();
 
-        // A large stack: unoptimised, the enumeration tables are built on the stack
-        // before being boxed, and overflow the 2 MB of a test thread.
-        let dir_str = tmp.to_str().unwrap().to_owned();
-        let failed = std::thread::Builder::new()
-            .stack_size(64 << 20)
-            .spawn(move || {
-                let prober = NalimovProber::new(&[&dir_str], 1).unwrap();
-                let mut rng = XorShift(0x2545_F491_4F6C_DD1D);
-                let mut failed = 0;
-                for _ in 0..2_000 {
-                    let sq: [u32; 4] = std::array::from_fn(|_| rng.below(64) as u32);
-                    if (1..4).any(|i| sq[..i].contains(&sq[i])) {
-                        continue;
-                    }
-                    let [wk, wq, bk, br] = sq.map(|s| 1u64 << s);
-                    let result = prober.probe(wk | wq, bk | br, wk | bk, wq, br, 0, 0, 0, true, 64);
-                    if matches!(result, Err(NalimovError::DecompressError(_))) {
-                        failed += 1;
-                    }
-                }
-                failed
-            })
+        let prober = NalimovProber::new(&[tmp.to_str().unwrap()], 1).unwrap();
+        let mut rng = XorShift(0x2545_F491_4F6C_DD1D);
+        let mut failed = 0;
+        for _ in 0..2_000 {
+            let sq: [u32; 4] = std::array::from_fn(|_| rng.below(64) as u32);
+            if (1..4).any(|i| sq[..i].contains(&sq[i])) {
+                continue;
+            }
+            let [wk, wq, bk, br] = sq.map(|s| 1u64 << s);
+            let result = prober.probe(wk | wq, bk | br, wk | bk, wq, br, 0, 0, 0, true, 64);
+            if matches!(result, Err(NalimovError::DecompressError(_))) {
+                failed += 1;
+            }
+        }
+        std::fs::remove_dir_all(&tmp).unwrap();
+        assert!(failed > 0, "no probe saw the damage");
+    }
+
+    #[test]
+    fn enumerations_build_on_a_default_thread_stack() {
+        // Unoptimised, building the tables on the stack overflowed the 2 MB that
+        // `std::thread::spawn` gives a thread. Covered only when this test is the first
+        // to touch them, as it is when run alone.
+        let legal = std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(|| get_enumerations().c_legal[X_PIECE_QUEEN][0])
             .unwrap()
             .join()
             .unwrap();
-        std::fs::remove_dir_all(&tmp).unwrap();
-        assert!(failed > 0, "no probe saw the damage");
+        assert!(legal > 0);
     }
 
     #[test]
