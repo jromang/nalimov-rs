@@ -3976,6 +3976,14 @@ fn djb2_hash(s: &str) -> u32 {
 /// Zero-allocation: works entirely on the stack.
 /// rgi_counters: [0-4] = white P,N,B,R,Q counts; [5-9] = black P,N,B,R,Q counts
 fn build_config_hash(rgi_counters: &[u32; 10]) -> (u32, bool) {
+    let invert = default_invert(rgi_counters);
+    (config_hash(rgi_counters, invert), invert)
+}
+
+/// Whether the black pieces come first in the table name, by the usual rule: the
+/// side with more pieces, then with the stronger ones. A table of equal strength, or
+/// one the rule gets wrong, is filed under the other name: the probe then tries it.
+fn default_invert(rgi_counters: &[u32; 10]) -> bool {
     let w_total: u32 = rgi_counters[0..5].iter().sum();
     let b_total: u32 = rgi_counters[5..10].iter().sum();
 
@@ -3990,12 +3998,15 @@ fn build_config_hash(rgi_counters: &[u32; 10]) -> (u32, bool) {
         .map(|(i, &c)| c * (i as u32 + 1))
         .sum();
 
-    let invert = if w_total != b_total {
+    if w_total != b_total {
         b_total > w_total
     } else {
         b_strength > w_strength
-    };
+    }
+}
 
+/// Hash of the table name with the black pieces first when `invert`.
+fn config_hash(rgi_counters: &[u32; 10], invert: bool) -> u32 {
     // Build config string on stack (max 8 chars: "k" + 3 pieces + "k" + 3 pieces)
     let mut buf = [0u8; 16];
     let mut pos = 0;
@@ -4024,7 +4035,7 @@ fn build_config_hash(rgi_counters: &[u32; 10]) -> (u32, bool) {
         hash = hash.wrapping_mul(33).wrapping_add(b as u32);
     }
 
-    (hash, invert)
+    hash
 }
 
 /// Build config string (allocating version, used only for file discovery).
@@ -4196,7 +4207,24 @@ impl NalimovProber {
         extract_pieces!(pawns & white,   0, 0, rgsq_white);
         extract_pieces!(pawns & black,   0, 5, rgsq_black);
 
-        let (hash, inverted) = build_config_hash(&rgi_counters);
+        // A table is filed under one name only, the one the original finds through
+        // the piece counters in either colour. The usual rule names most of them, but
+        // not a table of equal strength seen from the other side (KRR v KQB), nor the
+        // few it gets wrong (KQN v KRR is filed as kqnkrr, the rule says krrkqn):
+        // when its name is not loaded, the other orientation is tried.
+        let (hash, inverted) = {
+            let (hash, inverted) = build_config_hash(&rgi_counters);
+            let state = self.state.lock().unwrap();
+            if state.tables.contains_key(&hash) {
+                (hash, inverted)
+            } else {
+                let other = config_hash(&rgi_counters, !inverted);
+                if !state.tables.contains_key(&other) {
+                    return Err(NalimovError::PositionNotFound);
+                }
+                (other, !inverted)
+            }
+        };
 
         let sq_enp = if ep_square < 64 {
             ep_square as u32
@@ -4973,6 +5001,60 @@ mod tests {
             }
             std::fs::remove_dir_all(&tmp).unwrap();
             assert!(found > 0, "k{x}k{x}: no position found");
+        }
+    }
+
+    /// Directory holding pawnless six-piece tables (`NALIMOV_PATH_33`), at least KQN v
+    /// KRR, KQB v KRR and KRN v KBB. The tests that need it pass vacuously without it.
+    fn six_piece_dir() -> Option<std::path::PathBuf> {
+        let dir = std::path::PathBuf::from(std::env::var("NALIMOV_PATH_33").ok()?);
+        ["kqnkrr", "kqbkrr", "krnkbb"]
+            .iter()
+            .all(|t| dir.join(format!("{t}.nbw.emd")).is_file())
+            .then_some(dir)
+    }
+
+    /// Probe a position given as (piece letter, square) lists, kings first.
+    fn probe_lists(prober: &NalimovProber, white: &[(char, u32)], black: &[(char, u32)], wtm: bool) -> Result<NalimovResult, NalimovError> {
+        let bb = |list: &[(char, u32)], c: char| list.iter().filter(|(p, _)| *p == c).fold(0u64, |b, (_, s)| b | 1 << s);
+        let all = |list: &[(char, u32)]| list.iter().fold(0u64, |b, (_, s)| b | 1 << s);
+        let of = |c: char| bb(white, c) | bb(black, c);
+        prober.probe(all(white), all(black), of('k'), of('q'), of('r'), of('b'), of('n'), of('p'), wtm, 64)
+    }
+
+    /// Every pawnless table answers in both colours, and alike: swapping the colours
+    /// (pieces exchanged, board flipped, side to move flipped) leaves the result as it
+    /// was. KQN v KRR was found in neither colour, the name rule looking for krrkqn;
+    /// KQB v KRR and KRN v KBB, of equal strength, only with the named side on White.
+    #[test]
+    fn a_six_piece_table_answers_in_both_colours() {
+        let Some(dir) = six_piece_dir() else {
+            eprintln!("NALIMOV_PATH_33 not set: skipped");
+            return;
+        };
+        let prober = NalimovProber::new(&[dir.to_str().unwrap()], 64).unwrap();
+        let mut rng = XorShift(0x9E37_79B9_7F4A_7C15);
+        for (strong, weak) in [("qn", "rr"), ("qb", "rr"), ("rn", "bb")] {
+            let (mut found, mut swapped_found) = (0, 0);
+            for _ in 0..3_000 {
+                let sq: [u32; 6] = std::array::from_fn(|_| rng.below(64) as u32);
+                if (1..6).any(|i| sq[..i].contains(&sq[i])) {
+                    continue;
+                }
+                let s: Vec<char> = strong.chars().collect();
+                let w: Vec<char> = weak.chars().collect();
+                let white = [('k', sq[0]), (s[0], sq[1]), (s[1], sq[2])];
+                let black = [('k', sq[3]), (w[0], sq[4]), (w[1], sq[5])];
+                let wtm = rng.below(2) == 0;
+                let got = probe_lists(&prober, &white, &black, wtm);
+                // The same position with the colours swapped.
+                let flip = |l: &[(char, u32)]| l.iter().map(|&(p, s)| (p, s ^ 56)).collect::<Vec<_>>();
+                let swapped = probe_lists(&prober, &flip(&black), &flip(&white), !wtm);
+                assert_eq!(format!("{got:?}"), format!("{swapped:?}"), "k{strong}k{weak} {sq:?} wtm {wtm}");
+                found += got.is_ok() as u32;
+                swapped_found += swapped.is_ok() as u32;
+            }
+            assert!(found > 0 && swapped_found > 0, "k{strong}k{weak}: {found} found, {swapped_found} swapped");
         }
     }
 
