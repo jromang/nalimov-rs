@@ -4244,17 +4244,22 @@ impl NalimovProber {
 
         let f_invert = inverted;
 
-        // Determine if the table is symmetric (only WTM file exists).
-        // Must check before computing the index, since symmetric BTM needs swapped colors.
+        // Pick the file for the side to move. Only a table with the same material on
+        // both sides can stand in for its missing half, by swapping colours; for any
+        // other, the file of the other side indexes different positions, and reading it
+        // would return a wrong but plausible result. Must be decided before computing
+        // the index, since the symmetric lookup needs swapped colours.
+        let symmetric = w_pieces_cfg == b_pieces_cfg;
         let state = self.state.lock().unwrap();
         let table_entry = state.tables.get(&hash).ok_or(NalimovError::PositionNotFound)?;
         let lookup_side = if !table_entry[side].is_empty() {
             side
-        } else if !table_entry[1 - side].is_empty() {
+        } else if symmetric && !table_entry[1 - side].is_empty() {
             1 - side
         } else {
             return Err(NalimovError::PositionNotFound);
         };
+        debug_assert!(lookup_side == side || symmetric);
         drop(state);
 
         // For symmetric endgames probed as BTM, use IndCalcBF:
@@ -4890,6 +4895,85 @@ mod tests {
         }
         std::fs::remove_dir_all(&tmp).unwrap();
         assert!(failed > 0, "no probe saw the damage");
+    }
+
+    /// A temporary directory holding copies of the named files of the 3-4-5 set.
+    fn partial_set(dir: &std::path::Path, tag: &str, names: &[&str]) -> std::path::PathBuf {
+        let tmp = std::env::temp_dir().join(format!("nalimov-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        for name in names {
+            std::fs::copy(dir.join(name), tmp.join(name)).unwrap();
+        }
+        tmp
+    }
+
+    /// Probe K+`x` against K+`y` (piece letters) with kings and pieces on `sq`
+    /// (white king, white piece, black king, black piece).
+    fn probe_kxky(prober: &NalimovProber, x: char, y: char, sq: [u32; 4], wtm: bool) -> Result<NalimovResult, NalimovError> {
+        let [wk, wx, bk, by] = sq.map(|s| 1u64 << s);
+        let of = |c: char| (if x == c { wx } else { 0 }) | (if y == c { by } else { 0 });
+        prober.probe(wk | wx, bk | by, wk | bk, of('q'), of('r'), of('b'), of('n'), of('p'), wtm, 64)
+    }
+
+    /// Random distinct squares, pawns kept off the first and last ranks.
+    fn random_squares(rng: &mut XorShift, x: char, y: char) -> Option<[u32; 4]> {
+        let sq: [u32; 4] = std::array::from_fn(|_| rng.below(64) as u32);
+        let distinct = !(1..4).any(|i| sq[..i].contains(&sq[i]));
+        let pawn_ok = |piece: char, s: u32| piece != 'p' || (8..56).contains(&s);
+        (distinct && pawn_ok(x, sq[1]) && pawn_ok(y, sq[3])).then_some(sq)
+    }
+
+    #[test]
+    fn a_missing_half_of_an_asymmetric_table_is_not_guessed() {
+        let Some(dir) = table_dir() else {
+            eprintln!("NALIMOV_PATH not set: skipped");
+            return;
+        };
+        let tmp = partial_set(&dir, "half", &["kqkr.nbw.emd"]);
+        let half = NalimovProber::new(&[tmp.to_str().unwrap()], 1).unwrap();
+        let full = NalimovProber::new(&[dir.to_str().unwrap()], 1).unwrap();
+        let mut rng = XorShift(0x5DEE_CE66_D1CE_4E5B);
+        let (mut wtm_found, mut btm_refused) = (0, 0);
+        for _ in 0..2_000 {
+            let Some(sq) = random_squares(&mut rng, 'q', 'r') else { continue };
+            // White to move: the file is there, the answer is the full set's.
+            let got = probe_kxky(&half, 'q', 'r', sq, true);
+            let want = probe_kxky(&full, 'q', 'r', sq, true);
+            assert_eq!(format!("{got:?}"), format!("{want:?}"), "{sq:?} white to move");
+            wtm_found += got.is_ok() as u32;
+            // Black to move: kqkr.nbb is missing, and kqkr.nbw cannot stand in for it.
+            let got = probe_kxky(&half, 'q', 'r', sq, false);
+            assert!(matches!(got, Err(NalimovError::PositionNotFound)), "{sq:?}: {got:?}");
+            btm_refused += 1;
+        }
+        std::fs::remove_dir_all(&tmp).unwrap();
+        assert!(wtm_found > 0 && btm_refused > 0);
+    }
+
+    #[test]
+    fn a_symmetric_table_stands_in_for_its_missing_half() {
+        let Some(dir) = table_dir() else {
+            eprintln!("NALIMOV_PATH not set: skipped");
+            return;
+        };
+        let full = NalimovProber::new(&[dir.to_str().unwrap()], 1).unwrap();
+        for (x, name) in [('r', "krkr.nbw.emd"), ('q', "kqkq.nbw.emd"), ('p', "kpkp.nbw.emd")] {
+            // Only the white-to-move file: black to move goes through the colour swap,
+            // which must give what the real black-to-move file says.
+            let tmp = partial_set(&dir, &format!("sym-{x}"), &[name]);
+            let half = NalimovProber::new(&[tmp.to_str().unwrap()], 1).unwrap();
+            let mut rng = XorShift(0x2545_F491_4F6C_DD1D);
+            let mut found = 0;
+            for _ in 0..2_000 {
+                let Some(sq) = random_squares(&mut rng, x, x) else { continue };
+                let got = probe_kxky(&half, x, x, sq, false);
+                let want = probe_kxky(&full, x, x, sq, false);
+                assert_eq!(format!("{got:?}"), format!("{want:?}"), "k{x}k{x} {sq:?} black to move");
+                found += got.is_ok() as u32;
+            }
+            std::fs::remove_dir_all(&tmp).unwrap();
+            assert!(found > 0, "k{x}k{x}: no position found");
+        }
     }
 
     #[test]
